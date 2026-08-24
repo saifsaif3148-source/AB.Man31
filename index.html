@@ -550,6 +550,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 <div id="toast" class="toast-fixed hidden"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* ================= I18N ================= */
 const ADMIN_PIN = "1234";
@@ -903,41 +904,117 @@ let productModalInstance = null;
 let cartOffcanvasInstance = null;
 let pinModalInstance = null;
 
-/* ================= STORAGE (localStorage fallback) ================= */
-async function storageGet(key){
-  if(window.storage) return await window.storage.get(key, true);
-  const val = localStorage.getItem(key);
-  return val ? {key, value:val} : null;
+/* ================= STORAGE (Supabase) =================
+   1) Crée un projet sur https://supabase.com
+   2) Dans SQL Editor, exécute le script fourni (voir fichier supabase_schema.sql)
+   3) Remplace SUPABASE_URL et SUPABASE_ANON_KEY ci-dessous par les tiennes
+      (Project Settings -> API dans le dashboard Supabase)
+======================================================== */
+const SUPABASE_URL = "https://bvuxhurwtkjldofufqhw.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_6H4CFu5w-BPhCuELRVr_mg_DXGdEedo";
+
+const supabaseClient = (SUPABASE_URL.includes("VOTRE-PROJET") || SUPABASE_ANON_KEY.includes("VOTRE_CLE"))
+  ? null
+  : window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ---- mapping JS (camelCase) <-> colonnes Supabase (snake_case) ---- */
+function productToRow(p){
+  return {
+    id: p.id, category_key: p.categoryKey, price: p.price, old_price: p.oldPrice ?? null,
+    stock: p.stock, name: p.name, description: p.description, image: p.image ?? null
+  };
 }
-async function storageSet(key, val){
-  if(window.storage) return await window.storage.set(key, val, true);
-  localStorage.setItem(key, val);
-  return {key, value:val};
+function rowToProduct(r){
+  return {
+    id: r.id, categoryKey: r.category_key, price: r.price, oldPrice: r.old_price,
+    stock: r.stock, name: r.name, description: r.description, image: r.image
+  };
+}
+function orderToRow(o){
+  return {
+    id: o.id, customer_name: o.customer_name, phone_number: o.phone_number, wilaya_code: o.wilaya_code,
+    commune: o.commune, items: o.items, shipping_price: o.shipping_price, total_amount: o.total_amount,
+    status: o.status, created_at: o.created_at
+  };
+}
+function rowToOrder(r){
+  return {
+    id: r.id, customer_name: r.customer_name, phone_number: r.phone_number, wilaya_code: r.wilaya_code,
+    commune: r.commune, items: r.items, shipping_price: r.shipping_price, total_amount: r.total_amount,
+    status: r.status, created_at: r.created_at
+  };
 }
 
 async function loadAll(){
-  try{
-    const p = await storageGet("abman31:products");
-    products = p ? JSON.parse(p.value) : DEFAULT_PRODUCTS.slice();
-  }catch(e){ products = DEFAULT_PRODUCTS.slice(); }
-  if(!Array.isArray(products) || products.length===0){ products = DEFAULT_PRODUCTS.slice(); await saveProducts(); }
+  if(!supabaseClient){
+    showToast("Configure SUPABASE_URL / SUPABASE_ANON_KEY dans le code");
+    products = DEFAULT_PRODUCTS.slice();
+    shipping = Object.fromEntries(WILAYAS.map(w=>[w[0], w[3]]));
+    renderAll();
+    return;
+  }
 
   try{
-    const o = await storageGet("abman31:orders");
-    if(o) orders = JSON.parse(o.value);
-    else if(orders.length===0) orders = []; // Keep initial test orders if storage empty
-  }catch(e){ if(!orders.length) orders = []; }
+    const { data, error } = await supabaseClient.from("products").select("*").order("id");
+    if(error) throw error;
+    products = (data && data.length) ? data.map(rowToProduct) : [];
+    if(products.length===0){ products = DEFAULT_PRODUCTS.slice(); await saveProducts(); }
+  }catch(e){ console.error(e); products = DEFAULT_PRODUCTS.slice(); showToast(t("toastStorageError")); }
 
   try{
-    const s = await storageGet("abman31:shipping");
-    shipping = s ? JSON.parse(s.value) : Object.fromEntries(WILAYAS.map(w=>[w[0], w[3]]));
-  }catch(e){ shipping = Object.fromEntries(WILAYAS.map(w=>[w[0], w[3]])); }
+    const { data, error } = await supabaseClient.from("orders").select("*").order("created_at", {ascending:false});
+    if(error) throw error;
+    orders = data ? data.map(rowToOrder) : [];
+  }catch(e){ console.error(e); orders = []; showToast(t("toastStorageError")); }
+
+  try{
+    const { data, error } = await supabaseClient.from("shipping").select("*");
+    if(error) throw error;
+    shipping = (data && data.length)
+      ? Object.fromEntries(data.map(r=>[r.wilaya_code, r.price]))
+      : Object.fromEntries(WILAYAS.map(w=>[w[0], w[3]]));
+    if(!data || data.length===0) await saveShipping();
+  }catch(e){ console.error(e); shipping = Object.fromEntries(WILAYAS.map(w=>[w[0], w[3]])); showToast(t("toastStorageError")); }
 
   renderAll();
 }
-async function saveProducts(){ try{ await storageSet("abman31:products", JSON.stringify(products)); }catch(e){ showToast(t("toastStorageError")); } }
-async function saveOrders(){ try{ await storageSet("abman31:orders", JSON.stringify(orders)); }catch(e){ showToast(t("toastStorageError")); } }
-async function saveShipping(){ try{ await storageSet("abman31:shipping", JSON.stringify(shipping)); }catch(e){ showToast(t("toastStorageError")); } }
+
+/* Remplace intégralement le contenu de chaque table par l'état JS courant.
+   Simple et fiable pour un catalogue de taille boutique ; suffisant ici. */
+async function saveProducts(){
+  if(!supabaseClient) return;
+  try{
+    const { error: delErr } = await supabaseClient.from("products").delete().neq("id", "__none__");
+    if(delErr) throw delErr;
+    if(products.length){
+      const { error: insErr } = await supabaseClient.from("products").insert(products.map(productToRow));
+      if(insErr) throw insErr;
+    }
+  }catch(e){ console.error(e); showToast(t("toastStorageError")); }
+}
+async function saveOrders(){
+  if(!supabaseClient) return;
+  try{
+    const { error: delErr } = await supabaseClient.from("orders").delete().neq("id", "__none__");
+    if(delErr) throw delErr;
+    if(orders.length){
+      const { error: insErr } = await supabaseClient.from("orders").insert(orders.map(orderToRow));
+      if(insErr) throw insErr;
+    }
+  }catch(e){ console.error(e); showToast(t("toastStorageError")); }
+}
+async function saveShipping(){
+  if(!supabaseClient) return;
+  try{
+    const rows = Object.entries(shipping).map(([wilaya_code, price])=>({wilaya_code, price}));
+    const { error: delErr } = await supabaseClient.from("shipping").delete().neq("wilaya_code", "__none__");
+    if(delErr) throw delErr;
+    if(rows.length){
+      const { error: insErr } = await supabaseClient.from("shipping").insert(rows);
+      if(insErr) throw insErr;
+    }
+  }catch(e){ console.error(e); showToast(t("toastStorageError")); }
+}
 
 function showToast(msg){
   const el = document.getElementById("toast");
